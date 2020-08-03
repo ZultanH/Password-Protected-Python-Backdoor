@@ -28,7 +28,6 @@ def findPythonVersion():
 	return pythonList
 
 def amIRoot():
-	command = "whoami"
 	output = subprocess.Popen("whoami", shell=True, stdout=subprocess.PIPE)
 	return output.stdout.read() == b"root"
 
